@@ -5,6 +5,7 @@
 const nf = new Intl.NumberFormat('pt-BR');
 const fmt = (n) => nf.format(Math.round(n || 0));
 const pct = (x, d = 1) => (Number.isFinite(x) ? (x * 100).toLocaleString('pt-BR', { minimumFractionDigits: d, maximumFractionDigits: d }) + '%' : '–');
+const sinal = (n) => (n > 0 ? '+' : n < 0 ? '−' : '') + fmt(Math.abs(n));
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const norm = (s) => String(s ?? '').normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase();
 
@@ -17,20 +18,30 @@ const DIV = {
   light: ['#b8302f', '#e34948', '#f4a19e', '#f0efec', '#9ec5f4', '#3987e5', '#1c5cab'],
   dark: ['#e66767', '#c23f3e', '#7a2c2b', '#383835', '#184f95', '#2a78d6', '#86b6ef'],
 };
+// Cores das agremiações: paleta categórica em ordem fixa, pela votação real (a cor segue o partido,
+// não muda quando o simulador redistribui as cadeiras). Da 9ª em diante: cinza.
+const CAT = {
+  light: ['#2a78d6', '#eb6834', '#1baf7a', '#eda100', '#e87ba4', '#008300', '#6250d6', '#e34948'],
+  dark: ['#3987e5', '#d95926', '#199e70', '#c98500', '#d55181', '#008300', '#9085e9', '#e66767'],
+};
+const OUTROS = '#8b939a';
+
+const ELEICAO_2028 = new Date(2028, 9, 1); // 1º turno: primeiro domingo de outubro
 
 // ------------------------------------------------------------------ estado
 
 const S = {
   data: null,
   geo: null,
+  view: 'painel',
   cargo: 'vereador',
   metric: 'cand_pct',
   candA: null, // sq
   candB: null,
   bairro: null, // id
   side: 'cand',
-  tab: 'eleitos',
   rank: { q: '', partido: '', situacao: '', sort: 'votos', dir: -1 },
+  sim: [], // ajustes do simulador: { k: 'c:<sq>' | 'p:<sigla>', d: votos }
 };
 
 const D = {}; // índices derivados
@@ -44,6 +55,19 @@ const METRICS = {
   abstencao: { label: 'Abstenção', kind: 'pct' },
   brancos_nulos: { label: 'Brancos + nulos (sobre comparecimento)', kind: 'pct' },
   aptos: { label: 'Eleitores aptos', kind: 'num' },
+};
+
+const VIEWS = {
+  painel: { title: 'Dashboard', sub: 'Resumo da eleição municipal de 6 de outubro de 2024 em Mesquita/RJ.' },
+  mapa: { title: 'Mapa de votos', sub: 'De onde vieram os votos de cada candidato, bairro a bairro. O voto conta onde a urna está, não onde o eleitor mora.' },
+  raiox: { title: 'Raio-X da Câmara', sub: 'Como os votos para vereador viraram 12 cadeiras, e por que ter mais votos não garante a vaga.' },
+  simulador: { title: 'Simulador “E se?”', sub: 'Mude votos de candidatos ou de legenda e veja a Câmara se redistribuir com as regras oficiais de 2024.' },
+  eleitos: { title: 'Eleitos', table: true },
+  ranking: { title: 'Candidatos', table: true },
+  partidos: { title: 'Partidos', table: true },
+  bairros: { title: 'Bairros', table: true },
+  locais: { title: 'Locais de votação', table: true },
+  sobre: { title: 'Sobre os dados', table: true },
 };
 
 const theme = () => {
@@ -101,9 +125,19 @@ async function load() {
       D.leader[cargo][scope] = best;
     }
   }
+
+  // agremiação = partido isolado ou federação (a federação disputa como um partido só)
+  D.agDe = Object.fromEntries(data.partidos.map((p) => [p.sigla, p.federacao || p.sigla]));
+  const agTotal = {};
+  for (const p of data.partidos) agTotal[D.agDe[p.sigla]] = (agTotal[D.agDe[p.sigla]] || 0) + p.total_validos;
+  D.agTotal = agTotal;
+  D.agOrdem = Object.keys(agTotal).sort((a, b) => agTotal[b] - agTotal[a]);
+  D.real = simular([]);
+  D.margem = {};
 }
 
 const cands = () => D.byCargo[S.cargo];
+const vereadores = () => D.byCargo.vereador;
 const validosB = (bid) => D.validos[S.cargo].bairro[bid] || 0;
 const validosL = (lid) => D.validos[S.cargo].local[lid] || 0;
 const validosTotal = () => D.validos[S.cargo].total;
@@ -123,6 +157,126 @@ const candLabel = (c) => `${c.urna} · ${c.numero} · ${c.partido}`;
 const situacaoCurta = (s) => s.replace('ELEITO POR QP', 'Eleito (quociente)').replace('ELEITO POR MÉDIA', 'Eleito (média)')
   .replace('NÃO ELEITO', 'Não eleito').replace('SUPLENTE', 'Suplente').replace(/^ELEITO$/, 'Eleito');
 const isEleito = (c) => c.situacao.startsWith('ELEITO');
+const diasPara2028 = () => Math.max(0, Math.ceil((ELEICAO_2028 - new Date(new Date().toDateString())) / 86400000));
+
+// ------------------------------------------------------------------ simulação de cadeiras
+
+function montar(adj) {
+  const dC = {}, dP = {};
+  for (const a of adj) {
+    const alvo = a.k.startsWith('c:') ? dC : dP;
+    alvo[a.k.slice(2)] = (alvo[a.k.slice(2)] || 0) + a.d;
+  }
+  let validos = D.validos.vereador.total;
+  const ags = {};
+  const ag = (sigla) => (ags[D.agDe[sigla]] ??= { id: D.agDe[sigla], votos: 0, cands: [] });
+  for (const p of S.data.partidos) {
+    const leg = Math.max(0, p.legenda + (dP[p.sigla] || 0));
+    ag(p.sigla).votos += leg;
+    validos += leg - p.legenda;
+  }
+  for (const c of vereadores()) {
+    if (!c.valido) continue;
+    const v = Math.max(0, c.votos + (dC[c.sq] || 0));
+    const a = ag(c.partido);
+    a.votos += v;
+    a.cands.push({ sq: c.sq, votos: v });
+    validos += v - c.votos;
+  }
+  return { ags: Object.values(ags), validos };
+}
+
+function simular(adj) {
+  const { ags, validos } = montar(adj);
+  const r = Eleicao.distribuir(ags, S.data.meta.cadeiras, validos);
+  r.validos = validos;
+  r.agVotos = Object.fromEntries(ags.map((a) => [a.id, a.votos]));
+  return r;
+}
+
+// Menor busca binária em [lo, hi] onde ok(n) passa a ser verdadeiro (ok é monotônico na prática).
+function menorQue(ok, hi) {
+  let lo = 1;
+  if (!ok(hi)) return null;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (ok(mid)) hi = mid; else lo = mid + 1;
+  }
+  return lo;
+}
+
+// Para quem não se elegeu: quantos votos a mais bastariam. Para quem se elegeu: com quantos a menos perderia a vaga.
+function margem(c) {
+  if (!c || c.cargo !== 'vereador' || !c.valido) return null;
+  if (c.sq in D.margem) return D.margem[c.sq];
+  const k = 'c:' + c.sq;
+  let r;
+  if (D.real.eleitos.has(c.sq)) {
+    const n = menorQue((x) => !simular([{ k, d: -x }]).eleitos.has(c.sq), c.votos);
+    r = n == null ? null : { tipo: 'perde', n };
+  } else {
+    const n = menorQue((x) => simular([{ k, d: x }]).eleitos.has(c.sq), 60000);
+    r = n == null ? null : { tipo: 'falta', n };
+  }
+  D.margem[c.sq] = r;
+  return r;
+}
+
+function margens() {
+  return vereadores().filter((c) => c.valido).map((c) => ({ c, m: margem(c) })).filter((x) => x.m);
+}
+
+// ------------------------------------------------------------------ cores e hemiciclo
+
+function agColor(ag) {
+  const i = D.agOrdem.indexOf(ag);
+  return i >= 0 && i < 8 ? CAT[theme()][i] : OUTROS;
+}
+
+function seatTip(c, e, extra = '') {
+  const via = { QP: 'quociente partidário', MEDIA: 'maior média (sobras)', MEDIA_GERAL: 'maior média (sobras, sem mínimo)' }[e.via];
+  return esc(`<b>${esc(c.urna)}</b> · ${esc(c.partido)}<br><span class="muted">${fmt(c.votos)} votos · vaga por ${via}</span>${extra}`);
+}
+
+// Hemiciclo de 12 cadeiras (7 na fileira de fora, 5 na de dentro), agrupadas por agremiação.
+function hemiciclo(res, { destaque = null, votos = null, acao = 'cand' } = {}) {
+  const seats = [...res.eleitos.entries()]
+    .map(([sq, e]) => ({ c: D.cand[sq], e }))
+    .sort((a, b) => D.agOrdem.indexOf(a.e.ag) - D.agOrdem.indexOf(b.e.ag) || b.c.votos - a.c.votos);
+  const cx = 200, cy = 206, pad = 0.13;
+  const pos = [];
+  for (const [k, R] of [[7, 178], [5, 116]]) {
+    for (let i = 0; i < k; i++) {
+      const ang = Math.PI - pad - (i * (Math.PI - 2 * pad)) / (k - 1);
+      pos.push({ x: cx + R * Math.cos(ang), y: cy - R * Math.sin(ang), ang });
+    }
+  }
+  pos.sort((a, b) => b.ang - a.ang);
+  const circles = seats.map((s, i) => {
+    const p = pos[i];
+    if (!p) return '';
+    const novo = destaque && !destaque.has(s.c.sq);
+    const v = votos ? votos[s.c.sq] : s.c.votos;
+    const extra = votos && v !== s.c.votos ? `<br>Simulado: <b>${fmt(v)}</b> votos` : '';
+    const attr = acao === 'sim' ? `data-simpick="${s.c.sq}"` : `data-cand="${s.c.sq}"`;
+    return `${novo ? `<circle class="seat-ring" cx="${p.x.toFixed(1)}" cy="${p.y.toFixed(1)}" r="27"/>` : ''}
+      <circle class="seat" ${attr} cx="${p.x.toFixed(1)}" cy="${p.y.toFixed(1)}" r="21" fill="${agColor(s.e.ag)}"
+        stroke="var(--surface)" stroke-width="2" data-tip="${seatTip(s.c, s.e, extra)}" tabindex="0" role="button" aria-label="${esc(s.c.urna)}, ${esc(s.c.partido)}"/>`;
+  }).join('');
+  return `<div class="hemi-wrap"><svg class="hemi" viewBox="0 0 400 236" role="img" aria-label="Distribuição das ${seats.length} cadeiras">
+      ${circles}
+      <text class="hemi-total" x="200" y="190" text-anchor="middle">${seats.length}</text>
+      <text class="hemi-cap" x="200" y="210" text-anchor="middle">cadeiras</text>
+    </svg>${partyKey(res, destaque ? D.real : null)}</div>`;
+}
+
+function partyKey(res, base) {
+  const ags = D.agOrdem.filter((a) => res.vagas[a] || (base && base.vagas[a]));
+  return `<div class="party-key">${ags.map((a) => {
+    const d = base ? (res.vagas[a] || 0) - (base.vagas[a] || 0) : 0;
+    return `<span><i style="background:${agColor(a)}"></i>${esc(a)} <b>${res.vagas[a] || 0}</b>${d ? ` <span class="${d > 0 ? 'delta-up' : 'delta-down'}">(${d > 0 ? '+' : '−'}${Math.abs(d)})</span>` : ''}</span>`;
+  }).join('')}</div>`;
+}
 
 // ------------------------------------------------------------------ mapa
 
@@ -150,6 +304,7 @@ function initMap() {
 }
 
 function setTiles() {
+  if (!map) return;
   if (tileLayer) tileLayer.remove();
   // OSM padrão; o CSS (.leaflet-tile-pane) dessatura para o mapa base não competir com as cores dos dados.
   tileLayer = L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
@@ -282,6 +437,7 @@ function tipFor(bid) {
 }
 
 function renderMap() {
+  if (!map) return;
   currentScale = scale();
   geoLayer.setStyle(styleFeature);
   renderLabels();
@@ -383,12 +539,23 @@ function renderHint() {
   el.textContent = hints[S.metric] || '';
 }
 
-// ------------------------------------------------------------------ painel lateral
+// ------------------------------------------------------------------ painel lateral do mapa
 
 function renderSide() {
   document.querySelectorAll('.side-tabs button').forEach((b) => b.setAttribute('aria-selected', String(b.dataset.side === S.side)));
   const body = document.getElementById('side-body');
   body.innerHTML = S.side === 'bairro' ? sideBairro() : sideCand();
+}
+
+function margemLine(c) {
+  const m = margem(c);
+  if (!m) return '';
+  if (m.tipo === 'falta') {
+    return `<div class="callout">Faltaram <strong>${fmt(m.n)} votos</strong> para ${esc(c.urna)} conquistar uma cadeira (com as regras de 2024 e os demais votos iguais).
+      <a href="#v=simulador" data-simset="c:${c.sq}:${m.n}">Ver no simulador →</a></div>`;
+  }
+  return `<div class="callout">Margem: com <strong>${fmt(m.n)} votos a menos</strong>, ${esc(c.urna)} teria perdido a cadeira.
+    <a href="#v=simulador" data-simset="c:${c.sq}:${-m.n}">Ver no simulador →</a></div>`;
 }
 
 function sideCand() {
@@ -445,6 +612,7 @@ function sideCand() {
       <div class="stat"><div class="label">Posição</div><div class="value">${A.pos}º <small>de ${cands().length}</small></div></div>
       <div class="stat"><div class="label">% válidos</div><div class="value">${pct(cityShare, 2)}</div></div>
     </div>
+    ${margemLine(A)}
     ${partyLine}
     <p class="insight"><strong>${pct(top3Share, 0)}</strong> dos votos vieram de 3 bairros (${top3.map((r) => esc(r.b.nome)).join(', ')}).
       Melhor desempenho relativo: <strong>${esc(best?.b.nome)}</strong>, com ${pct(best.v / best.val)} dos válidos (${(best.v / best.val / (cityShare || 1)).toLocaleString('pt-BR', { maximumFractionDigits: 1 })}× a média da cidade).</p>
@@ -495,14 +663,303 @@ function sideBairro() {
     <div class="bars">${locais.map((l) => `<button type="button" class="bar-row" data-local="${l.id}"><span class="name" title="${esc(l.nome)}">${esc(l.nome)}</span><span class="track"></span><span class="val">${fmt(l.aptos)} aptos</span></button>`).join('')}</div>`;
 }
 
-// ------------------------------------------------------------------ tabelas
+// ------------------------------------------------------------------ dashboard
 
-function renderTable() {
-  document.querySelectorAll('#table-tabs button').forEach((b) => b.setAttribute('aria-selected', String(b.dataset.tab === S.tab)));
-  const el = document.getElementById('table-body');
-  const fn = { eleitos: tblEleitos, ranking: tblRanking, partidos: tblPartidos, bairros: tblBairros, locais: tblLocais, sobre: tblSobre }[S.tab];
-  el.innerHTML = fn();
+function widget(cls, icon, label, value, note, link, href, text = false) {
+  return `<div class="widget ${cls}"><span class="w-icon" aria-hidden="true">${icon}</span>
+    <div class="w-label">${label}</div><div class="w-value ${text ? 'text' : ''}">${value}</div><div class="w-note">${note}</div>
+    <a class="w-link" href="#v=${href}">${link}<span aria-hidden="true">→</span></a></div>`;
 }
+
+function renderPainel() {
+  const bs = S.data.bairros;
+  const aptos = bs.reduce((s, b) => s + b.aptos, 0);
+  const comp = bs.reduce((s, b) => s + b.comparecimento, 0);
+  const first = cands()[0];
+  const vt = validosTotal();
+  const dias = diasPara2028();
+  document.getElementById('widgets').innerHTML = [
+    widget('w-blue', '◉', 'Eleitores aptos', fmt(aptos), `${S.data.locais.length} locais de votação · ${bs.filter((b) => hasData(b.id)).length} bairros com urnas`, 'Ver no mapa', 'mapa'),
+    widget('w-violet', '✓', 'Comparecimento', pct(comp / aptos), `${fmt(aptos - comp)} eleitores não foram votar`, 'Bairros', 'bairros'),
+    S.cargo === 'vereador'
+      ? widget('w-aqua', '◧', 'Quociente eleitoral', fmt(S.data.meta.quociente_eleitoral), `votos por cadeira · ${S.data.meta.cadeiras} cadeiras`, 'Raio-X da Câmara', 'raiox')
+      : widget('w-aqua', '★', 'Prefeito eleito', esc(first.urna), `${esc(first.partido)} · ${pct(first.votos / vt)} dos válidos`, 'Resultado completo', 'eleitos', true),
+    widget('w-red', '⏱', 'Dias para a eleição', fmt(dias), '1º turno em 01/10/2028', 'Simular cenários', 'simulador'),
+  ].join('');
+
+  const nomEleitos = [...D.real.eleitos.keys()].reduce((s, sq) => s + D.cand[sq].votos, 0);
+  document.getElementById('dash-camara').innerHTML = `${hemiciclo(D.real)}
+    <p class="insight" style="text-align:center;margin-top:10px">Só <strong>${pct(nomEleitos / D.real.validos, 0)}</strong> dos votos válidos para vereador foram para quem se elegeu.
+    Clique numa cadeira para ver o vereador no mapa.</p>`;
+
+  document.getElementById('dash-top-title').textContent = `Mais votados · ${S.cargo}`;
+  const top = cands().slice(0, 10);
+  const max = top[0]?.votos || 1;
+  document.getElementById('dash-top').innerHTML = `<div class="bars">${top.map((c) => `
+    <button type="button" class="bar-row" data-cand="${c.sq}">
+      <span class="name" title="${esc(c.nome)}">${esc(c.urna)} <small>${esc(c.partido)}</small></span>
+      <span class="track"><span class="fill ${isEleito(c) ? 'a' : 'muted'}" style="width:${(c.votos / max) * 100}%"></span></span>
+      <span class="val"><strong>${fmt(c.votos)}</strong> · ${pct(c.votos / vt)}</span></button>`).join('')}</div>
+    <div class="key" style="margin-top:8px"><span><i style="background:var(--bar-a)"></i>Eleito</span><span><i style="background:var(--bar-muted)"></i>Não eleito</span></div>`;
+
+  const bsd = bs.filter((b) => hasData(b.id)).map((b) => ({ b, v: b.comparecimento / b.aptos })).sort((x, y) => y.v - x.v);
+  document.getElementById('dash-bairros').innerHTML = `<div class="bars">${bsd.map((r) => `
+    <button type="button" class="bar-row" data-bairro="${r.b.id}">
+      <span class="name">${esc(r.b.nome)}</span>
+      <span class="track"><span class="fill a" style="width:${r.v * 100}%"></span></span>
+      <span class="val"><strong>${pct(r.v)}</strong> · ${fmt(r.b.aptos)} aptos</span></button>`).join('')}</div>`;
+
+  const fio = margens().filter((x) => x.m.tipo === 'falta').sort((a, b) => a.m.n - b.m.n).slice(0, 6);
+  document.getElementById('dash-fio').innerHTML = `<p class="insight">Candidatos que ficaram mais perto de uma cadeira: quantos votos a mais teriam bastado, mantendo todos os outros votos iguais.</p>
+    <div class="chip-list">${fio.map(({ c, m }) => `
+      <button type="button" class="chip" data-simset="c:${c.sq}:${m.n}">
+        <span class="c-name">${esc(c.urna)} <small>${esc(c.partido)} · ${fmt(c.votos)} votos</small></span>
+        <span class="c-meta">faltaram <b>${fmt(m.n)}</b></span></button>`).join('')}</div>`;
+}
+
+// ------------------------------------------------------------------ Raio-X
+
+function renderRaiox() {
+  const R = D.real;
+  const qe = R.qe;
+  const V = R.validos;
+  const ver = vereadores();
+  const eleitos = ver.filter((c) => R.eleitos.has(c.sq));
+  const nomEleitos = eleitos.reduce((s, c) => s + c.votos, 0);
+  const nomTodos = ver.filter((c) => c.valido).reduce((s, c) => s + c.votos, 0);
+  const legenda = S.data.partidos.reduce((s, p) => s + p.legenda, 0);
+  const nomNao = nomTodos - nomEleitos;
+  const naoEleitos = ver.filter((c) => c.valido && !R.eleitos.has(c.sq)).length;
+  const t = theme();
+
+  const top = [...eleitos].sort((a, b) => b.votos - a.votos)[0];
+  const minEleito = [...eleitos].sort((a, b) => a.votos - b.votos)[0];
+  const fora = ver.filter((c) => c.valido && !R.eleitos.has(c.sq) && c.votos > minEleito.votos);
+  const agSem = D.agOrdem.filter((a) => !R.vagas[a]);
+  const votosSem = agSem.reduce((s, a) => s + D.agTotal[a], 0);
+
+  const seg = [
+    ['Em candidatos eleitos', nomEleitos, CAT[t][0]],
+    ['Em candidatos não eleitos', nomNao, 'var(--bar-muted)'],
+    ['Só no partido (voto de legenda)', legenda, CAT[t][3]],
+  ];
+  const hero = `<div class="panel"><div class="panel-head"><h2>Para onde foram os ${fmt(V)} votos válidos</h2></div>
+    <div class="panel-body hero">
+      <div>
+        <div class="hero-num">${pct(nomEleitos / V, 0)}</div>
+        <p class="hero-lead">dos votos para vereador foram para quem se elegeu.</p>
+        <p class="hero-sub">Os outros ${fmt(V - nomEleitos)} votos foram para ${naoEleitos} candidatos que não se elegeram ou só para o partido.
+          Eles não foram perdidos: no sistema proporcional, todo voto soma para o partido e decide quantas cadeiras cada um leva.
+          Quem ocupa a cadeira são os mais votados dentro de cada partido.</p>
+      </div>
+      <div>
+        <div class="stack" role="img" aria-label="Divisão dos votos válidos">${seg.map(([l, v, c]) => `<span style="width:${(v / V) * 100}%;background:${c}" data-tip="${esc(`<b>${l}</b><br>${fmt(v)} votos · ${pct(v / V)}`)}"></span>`).join('')}</div>
+        <div class="stack-key">${seg.map(([l, v, c]) => `<div><i style="background:${c}"></i>${l}<b>${fmt(v)} · ${pct(v / V)}</b></div>`).join('')}</div>
+        ${hemiciclo(R)}
+      </div>
+    </div></div>`;
+
+  const facts = `<div class="facts">
+    <div class="fact"><div class="f-num">${pct(top.votos / qe, 0)}</div><div class="f-lead">foi o máximo que um vereador teve do quociente</div>
+      <p>Ninguém se elegeu sozinho. O mais votado, ${esc(top.urna)}, teve ${fmt(top.votos)} votos, menos da metade dos ${fmt(qe)} que valem uma cadeira. Todos os 12 dependeram dos votos do partido.</p></div>
+    <div class="fact f-violet"><div class="f-num">${fora.length}</div><div class="f-lead">candidatos tiveram mais votos que um eleito e ficaram de fora</div>
+      <p>O eleito com menos votos, ${esc(minEleito.urna)} (${esc(minEleito.partido)}), teve ${fmt(minEleito.votos)}. ${fora.map((c) => esc(c.urna)).join(', ')} tiveram mais e não entraram.</p></div>
+    <div class="fact f-red"><div class="f-num">${fmt(votosSem)}</div><div class="f-lead">votos (${pct(votosSem / V, 0)}) foram para partidos que não elegeram ninguém</div>
+      <p>${agSem.length} das ${D.agOrdem.length} agremiações não chegaram a nenhuma cadeira. A maior delas foi ${esc(agSem[0])}, com ${fmt(D.agTotal[agSem[0]])} votos.</p></div>
+  </div>`;
+
+  // barra de cada eleito até o quociente (o trilho cheio = 1 QE)
+  const quota = `<div class="panel"><div class="panel-head"><h2>Ninguém chegou ao quociente sozinho</h2></div><div class="panel-body">
+    <p class="insight">Cada trilho vai até o quociente eleitoral (${fmt(qe)} votos, o preço de uma cadeira). A parte pintada é o que o vereador conseguiu com o próprio nome.</p>
+    <div class="bars">${[...eleitos].sort((a, b) => b.votos - a.votos).map((c) => `
+      <button type="button" class="bar-row" data-cand="${c.sq}">
+        <span class="name">${esc(c.urna)} <small>${esc(c.partido)}</small></span>
+        <span class="track" style="background:var(--surface-2);border-radius:4px"><span class="fill" style="width:${(c.votos / qe) * 100}%;background:${agColor(R.eleitos.get(c.sq).ag)}"></span></span>
+        <span class="val"><strong>${fmt(c.votos)}</strong> · ${pct(c.votos / qe, 0)} do QE</span></button>`).join('')}</div></div></div>`;
+
+  // duelos: quem ficou de fora × eleitos com menos votos
+  const usados = new Set();
+  const asc = [...eleitos].sort((a, b) => a.votos - b.votos);
+  const duelos = fora.map((o) => {
+    const e = asc.find((x) => !usados.has(x.sq) && x.votos < o.votos) || asc[0];
+    usados.add(e.sq);
+    return [o, e];
+  });
+  const porque = (c, dentro) => {
+    const ag = D.agDe[c.partido];
+    const n = R.vagas[ag] || 0;
+    const colegas = eleitos.filter((x) => D.agDe[x.partido] === ag);
+    if (dentro) {
+      const k = ver.filter((x) => x.valido && D.agDe[x.partido] === ag && x.votos > c.votos).length + 1;
+      return `${esc(ag)} somou ${fmt(D.agTotal[ag])} votos e levou ${n} ${n === 1 ? 'cadeira' : 'cadeiras'}; ele era o ${k}º do partido.`;
+    }
+    const m = margem(c);
+    return `${esc(ag)} levou ${n} ${n === 1 ? 'cadeira' : 'cadeiras'}${colegas.length ? `, ocupadas por ${colegas.map((x) => esc(x.urna)).join(' e ')}` : ''}.${m ? ` Faltaram ${fmt(m.n)} votos.` : ''}`;
+  };
+  const duel = `<div class="panel"><div class="panel-head"><h2>Mais votos, sem cadeira</h2></div><div class="panel-body">
+    ${duelos.map(([o, e]) => `<div class="duel">
+      <div class="duel-side out" data-cand="${o.sq}"><div class="d-tag">✕ Ficou de fora</div><div class="d-name">${esc(o.urna)} <small>${esc(o.partido)}</small></div>
+        <div class="d-votes">${fmt(o.votos)} votos</div><div class="d-why">${porque(o, false)}</div></div>
+      <div class="duel-vs">×</div>
+      <div class="duel-side in" data-cand="${e.sq}"><div class="d-tag">✓ Eleito</div><div class="d-name">${esc(e.urna)} <small>${esc(e.partido)}</small></div>
+        <div class="d-votes">${fmt(e.votos)} votos</div><div class="d-why">${porque(e, true)}</div></div>
+    </div>`).join('')}</div></div>`;
+
+  // se valesse só o mais votado
+  const top12 = ver.filter((c) => c.valido).slice(0, S.data.meta.cadeiras);
+  const top12s = new Set(top12.map((c) => c.sq));
+  const entrariam = top12.filter((c) => !R.eleitos.has(c.sq));
+  const sairiam = eleitos.filter((c) => !top12s.has(c.sq));
+  const chip = (c, cls, sign) => `<button type="button" class="chip ${cls}" data-cand="${c.sq}"><span class="c-sign">${sign}</span>
+    <span class="c-name">${esc(c.urna)} <small>${esc(c.partido)}</small></span><span class="c-meta">${fmt(c.votos)} votos · ${c.pos}º</span></button>`;
+  const swap = `<div class="panel"><div class="panel-head"><h2>Se fosse “os 12 mais votados levam”</h2></div><div class="panel-body">
+    <p class="insight">No voto majoritário (o “distritão”, já rejeitado pelo Congresso), entrariam os 12 com mais votos, sem olhar o partido.
+      <strong>${entrariam.length} ${entrariam.length === 1 ? 'cadeira mudaria' : 'cadeiras mudariam'} de dono</strong>.</p>
+    <div class="swap"><div><h3>Entrariam</h3><div class="chip-list">${entrariam.map((c) => chip(c, 'in', '+')).join('')}</div></div>
+      <div><h3>Sairiam</h3><div class="chip-list">${sairiam.map((c) => chip(c, 'out', '−')).join('')}</div></div></div></div></div>`;
+
+  // por um fio
+  const ms = margens();
+  const perto = ms.filter((x) => x.m.tipo === 'falta').sort((a, b) => a.m.n - b.m.n).slice(0, 8);
+  const frageis = ms.filter((x) => x.m.tipo === 'perde').sort((a, b) => a.m.n - b.m.n).slice(0, 5);
+  const fio = `<div class="panel"><div class="panel-head"><h2>Por um fio</h2><a class="panel-link" href="#v=simulador">Abrir o simulador →</a></div><div class="panel-body">
+    <div class="swap">
+      <div><h3>Mais perto de entrar <small>votos a mais que bastariam</small></h3><div class="chip-list">${perto.map(({ c, m }) => `
+        <button type="button" class="chip" data-simset="c:${c.sq}:${m.n}"><span class="c-name">${esc(c.urna)} <small>${esc(c.partido)} · ${fmt(c.votos)}</small></span><span class="c-meta">+<b>${fmt(m.n)}</b></span></button>`).join('')}</div></div>
+      <div><h3>Mais perto de sair <small>votos a menos que derrubariam</small></h3><div class="chip-list">${frageis.map(({ c, m }) => `
+        <button type="button" class="chip" data-simset="c:${c.sq}:${-m.n}"><span class="c-name">${esc(c.urna)} <small>${esc(c.partido)} · ${fmt(c.votos)}</small></span><span class="c-meta">−<b>${fmt(m.n)}</b></span></button>`).join('')}</div></div>
+    </div>
+    <p class="insight" style="margin-top:10px">Cada número considera só aquele candidato mudando e todos os outros votos iguais. Clique para ver a Câmara que resultaria.</p></div></div>`;
+
+  // preço de uma cadeira por agremiação
+  const maxAg = D.agTotal[D.agOrdem[0]];
+  const custo = `<div class="panel"><div class="panel-head"><h2>Quanto custou cada cadeira</h2></div><div class="panel-body">
+    <p class="insight">Votos de cada agremiação (partido ou federação) e quantos votos ela precisou por cadeira. Barras cinza: não elegeu ninguém.</p>
+    <div class="bars">${D.agOrdem.slice(0, 12).map((a) => {
+      const n = R.vagas[a] || 0;
+      return `<div class="bar-row"><span class="name">${esc(a)}</span>
+        <span class="track"><span class="fill" style="width:${(D.agTotal[a] / maxAg) * 100}%;background:${n ? agColor(a) : 'var(--bar-muted)'}"></span></span>
+        <span class="val"><strong>${fmt(D.agTotal[a])}</strong> · ${n ? `${n} ${n === 1 ? 'cadeira' : 'cadeiras'} · ${fmt(D.agTotal[a] / n)}/cadeira` : 'nenhuma cadeira'}</span></div>`;
+    }).join('')}</div></div></div>`;
+
+  document.getElementById('raiox').innerHTML = `${hero}${facts}<div class="grid-2"><div>${quota}${swap}</div><div>${duel}${fio}</div></div>${custo}`;
+}
+
+// ------------------------------------------------------------------ simulador
+
+function simTargetLabel(k) {
+  if (k.startsWith('p:')) { const p = D.partido[k.slice(2)]; return `Legenda · ${p.sigla} · ${p.numero}`; }
+  return candLabel(D.cand[k.slice(2)]);
+}
+
+function resolveSimTarget(text) {
+  const t = norm(text).trim();
+  if (!t) return null;
+  if (t.startsWith('legenda')) {
+    const p = S.data.partidos.find((x) => norm(`Legenda · ${x.sigla} · ${x.numero}`) === t)
+      || S.data.partidos.find((x) => t.includes(norm(x.sigla)));
+    return p ? 'p:' + p.sigla : null;
+  }
+  const sq = resolveIn(vereadores().filter((c) => c.valido), text);
+  return sq ? 'c:' + sq : null;
+}
+
+function addAdj(k, d) {
+  if (!k || !d) return;
+  const a = S.sim.find((x) => x.k === k);
+  if (a) a.d += d; else S.sim.push({ k, d });
+  S.sim = S.sim.filter((x) => x.d !== 0);
+}
+
+function simPresets() {
+  if (D.presets) return D.presets;
+  const R = D.real;
+  const ver = vereadores();
+  const eleitos = ver.filter((c) => R.eleitos.has(c.sq));
+  const minEleito = [...eleitos].sort((a, b) => a.votos - b.votos)[0];
+  const foraTop = ver.find((c) => c.valido && !R.eleitos.has(c.sq));
+  const out = [];
+  const mf = margem(foraTop);
+  if (mf) out.push({ adj: [{ k: 'c:' + foraTop.sq, d: mf.n }], html: `<strong>${esc(foraTop.urna)}</strong>, o mais votado que ficou de fora: quantos votos faltaram? (+${fmt(mf.n)})` });
+  const top = ver[0];
+  out.push({ adj: [{ k: 'c:' + top.sq, d: 10000 }], html: `Efeito “puxador”: e se <strong>${esc(top.urna)}</strong> tivesse 10 mil votos a mais?` });
+  const agSem = D.agOrdem.find((a) => !R.vagas[a]);
+  const sigla = S.data.partidos.filter((p) => D.agDe[p.sigla] === agSem).sort((a, b) => b.total_validos - a.total_validos)[0]?.sigla;
+  if (sigla) {
+    const n = menorQue((x) => (simular([{ k: 'p:' + sigla, d: x }]).vagas[agSem] || 0) > 0, 20000);
+    if (n) out.push({ adj: [{ k: 'p:' + sigla, d: n }], html: `Quantos votos de legenda faltaram para <strong>${esc(agSem)}</strong> eleger alguém? (+${fmt(n)})` });
+  }
+  const mp = margem(minEleito);
+  if (mp) out.push({ adj: [{ k: 'c:' + minEleito.sq, d: -mp.n }], html: `E se <strong>${esc(minEleito.urna)}</strong>, o eleito com menos votos, tivesse ${fmt(mp.n)} a menos?` });
+  D.presets = out;
+  return out;
+}
+
+function renderSimulador() {
+  const res = simular(S.sim);
+  const R = D.real;
+  const entram = [...res.eleitos.keys()].filter((sq) => !R.eleitos.has(sq)).map((sq) => D.cand[sq]);
+  const saem = [...R.eleitos.keys()].filter((sq) => !res.eleitos.has(sq)).map((sq) => D.cand[sq]);
+  const { ags } = montar(S.sim);
+  const votosSim = Object.fromEntries(ags.flatMap((a) => a.cands.map((c) => [c.sq, c.votos])));
+  const opts = [
+    ...vereadores().filter((c) => c.valido).map((c) => candLabel(c)),
+    ...S.data.partidos.map((p) => `Legenda · ${p.sigla} · ${p.numero}`),
+  ];
+  const prev = document.getElementById('sim-alvo')?.value || '';
+  const prevD = document.getElementById('sim-d')?.value || '500';
+
+  const verdict = S.sim.length === 0
+    ? '<p class="verdict same">Esta é a Câmara eleita de verdade. Faça um ajuste para simular.</p>'
+    : entram.length
+      ? `<p class="verdict">${entram.length} ${entram.length === 1 ? 'cadeira muda' : 'cadeiras mudam'} de dono</p>`
+      : '<p class="verdict same">Com esses votos, a Câmara continuaria a mesma.</p>';
+  const chip = (c, cls, sign) => `<button type="button" class="chip ${cls}" data-simpick="${c.sq}"><span class="c-sign">${sign}</span>
+    <span class="c-name">${esc(c.urna)} <small>${esc(c.partido)}</small></span><span class="c-meta">${fmt(votosSim[c.sq] ?? c.votos)} votos</span></button>`;
+
+  document.getElementById('simulador').innerHTML = `<div class="sim-grid">
+    <div>
+      <div class="panel"><div class="panel-head"><h2>Ajustes</h2></div><div class="panel-body">
+        <div class="adj-form">
+          <label class="field"><span>Candidato a vereador ou voto de legenda</span>
+            <input id="sim-alvo" list="sim-list" placeholder="Nome, número ou “Legenda PL”" autocomplete="off" value="${esc(prev)}"></label>
+          <datalist id="sim-list">${opts.map((o) => `<option value="${esc(o)}"></option>`).join('')}</datalist>
+          <div class="row">
+            <label class="field"><span>Votos (use − para tirar)</span><input id="sim-d" type="number" step="50" value="${esc(prevD)}"></label>
+            <button type="button" class="btn primary" id="sim-add">Aplicar</button>
+          </div>
+          <div class="quick">${[-1000, -500, -100, 100, 500, 1000, 5000].map((n) => `<button type="button" class="btn sm" data-quick="${n}">${sinal(n)}</button>`).join('')}</div>
+          <div class="adj-list">${S.sim.map((a, i) => `<div class="adj"><span class="a-name">${esc(simTargetLabel(a.k))}</span>
+            <span class="a-delta ${a.d > 0 ? 'up' : 'down'}">${sinal(a.d)}</span><button type="button" data-unadj="${i}" aria-label="Remover ajuste">✕</button></div>`).join('')
+            || '<p class="insight">Nenhum ajuste ainda. Escolha um candidato, digite quantos votos somar ou tirar e clique em Aplicar. Clicar numa cadeira também escolhe o vereador.</p>'}</div>
+          ${S.sim.length ? '<button type="button" class="btn" id="sim-reset">Desfazer tudo</button>' : ''}
+        </div></div></div>
+      <div class="panel"><div class="panel-head"><h2>Experimente</h2></div><div class="panel-body">
+        <div class="presets">${simPresets().map((p, i) => `<button type="button" class="preset" data-preset="${i}">${p.html}</button>`).join('')}</div>
+      </div></div>
+    </div>
+    <div>
+      <div class="panel"><div class="panel-head"><h2>Câmara simulada</h2>${S.sim.length ? '<span class="panel-link">tracejado = cadeira que mudou</span>' : ''}</div><div class="panel-body">
+        ${verdict}
+        ${hemiciclo(res, { destaque: S.sim.length ? new Set(R.eleitos.keys()) : null, votos: votosSim, acao: 'sim' })}
+        <div class="sim-status">
+          <span>Votos válidos: <b>${fmt(res.validos)}</b>${res.validos !== R.validos ? ` (${sinal(res.validos - R.validos)})` : ''}</span>
+          <span>Quociente eleitoral: <b>${fmt(res.qe)}</b>${res.qe !== R.qe ? ` (era ${fmt(R.qe)})` : ''}</span>
+        </div>
+        ${entram.length ? `<div class="swap" style="margin-top:14px"><div><h3>Entrariam</h3><div class="chip-list">${entram.map((c) => chip(c, 'in', '+')).join('')}</div></div>
+          <div><h3>Sairiam</h3><div class="chip-list">${saem.map((c) => chip(c, 'out', '−')).join('')}</div></div></div>` : ''}
+      </div></div>
+      <div class="panel"><div class="panel-head"><h2>Como a conta é feita</h2></div><div class="panel-body prose">
+        <ul>
+          <li><strong>Quociente eleitoral</strong> = votos válidos ÷ 12 cadeiras. Votos somados aqui entram nos válidos, então o quociente também sobe.</li>
+          <li><strong>Quociente partidário</strong> = votos do partido ou federação ÷ quociente eleitoral, arredondado para baixo. São as vagas diretas, para os mais votados do partido com pelo menos 10% do quociente.</li>
+          <li><strong>Sobras</strong>: cadeiras restantes vão, uma a uma, para a maior média (votos ÷ vagas já obtidas + 1), entre partidos com 80% do quociente e candidatos com 20%. Se ainda sobrar, todos disputam sem mínimo.</li>
+          <li>Com os votos reais, a conta reproduz exatamente os 12 eleitos e o tipo de vaga de cada um (quociente ou média) informados pelo TSE.</li>
+        </ul></div></div>
+    </div></div>`;
+}
+
+// ------------------------------------------------------------------ tabelas
 
 function strongestBairro(c) {
   let best = null;
@@ -515,8 +972,8 @@ function tblEleitos() {
   const max = list[0]?.votos || 1;
   const vt = validosTotal();
   const intro = S.cargo === 'vereador'
-    ? `<p class="insight" style="margin-top:12px">${list.length} cadeiras na Câmara. Quociente eleitoral: <strong>${fmt(S.data.meta.quociente_eleitoral)}</strong> votos (válidos ÷ cadeiras). Clique numa linha para ver o candidato no mapa.</p>`
-    : `<p class="insight" style="margin-top:12px">Resultado para prefeito (todos os candidatos).</p>`;
+    ? `<p class="insight">${list.length} cadeiras na Câmara. Quociente eleitoral: <strong>${fmt(S.data.meta.quociente_eleitoral)}</strong> votos (válidos ÷ cadeiras). Clique numa linha para ver o candidato no mapa.</p>`
+    : `<p class="insight">Resultado para prefeito (todos os candidatos).</p>`;
   const rows = (S.cargo === 'vereador' ? list : cands()).map((c) => `<tr data-cand="${c.sq}" class="${c.sq === S.candA ? 'is-sel' : ''}">
       <td>${c.pos}º</td><td><strong>${esc(c.urna)}</strong><br><small>${esc(c.nome)}</small></td><td>${c.numero}</td><td>${esc(c.partido)}</td>
       <td class="r">${fmt(c.votos)}<span class="mini-bar" style="width:${(c.votos / max) * 60}px"></span></td><td class="r">${pct(c.votos / vt, 2)}</td>
@@ -579,7 +1036,7 @@ function tblPartidos() {
       <td class="r">${fmt(p.nominais)}</td><td class="r">${fmt(p.legenda)}</td><td class="r">${fmt(p.total_validos)}</td><td class="r">${pct(p.legenda / (p.total_validos || 1))}</td>
       <td class="r">${p.eleitos}</td><td>${top ? `<span data-cand="${top.sq}" style="cursor:pointer;text-decoration:underline dotted">${esc(top.urna)}</span> <small>${fmt(top.votos)}</small>` : '–'}</td></tr>`;
   }).join('');
-  return `<p class="insight" style="margin-top:12px">Quociente eleitoral = ${fmt(vt)} votos válidos ÷ ${S.data.meta.cadeiras} cadeiras = <strong>${fmt(qe)}</strong>.
+  return `<p class="insight">Quociente eleitoral = ${fmt(vt)} votos válidos ÷ ${S.data.meta.cadeiras} cadeiras = <strong>${fmt(qe)}</strong>.
       O quociente partidário (votos ÷ QE, arredondado para baixo) dá as vagas diretas; o restante foi distribuído pelas maiores médias.</p>
     <div class="section-title">Por agremiação <small>partido isolado ou federação</small></div>
     <div class="table-wrap"><table><thead><tr><th>Agremiação</th><th class="r">Votos válidos</th><th class="r">% válidos</th><th class="r">% do QE</th><th class="r">Quociente partidário</th><th class="r">Eleitos</th></tr></thead><tbody>${agRows}</tbody></table></div>
@@ -596,7 +1053,7 @@ function tblBairros() {
       <td class="r">${pct(b.comparecimento / b.aptos)}</td><td class="r">${pct(b.abstencoes / b.aptos)}</td><td class="r">${pct(brancosNulos('bairro', b.id) / b.comparecimento)}</td>
       <td>${c ? `${esc(c.urna)} <small>${esc(c.partido)} · ${pct(l.v / (validosB(b.id) || 1))}</small>` : '–'}</td></tr>`;
   }).join('');
-  return `<p class="insight" style="margin-top:12px">Os números de cada bairro somam as urnas instaladas nele. Clique numa linha para destacar o bairro no mapa.</p>
+  return `<p class="insight">Os números de cada bairro somam as urnas instaladas nele. Clique numa linha para ver o bairro no mapa.</p>
     <div class="table-wrap"><table><thead><tr><th>Bairro</th><th class="r">Locais</th><th class="r">Aptos</th><th class="r">Comparecimento</th><th class="r">Abstenção</th><th class="r">Brancos+nulos</th><th>Mais votado (${S.cargo})</th></tr></thead><tbody>${rows}</tbody></table></div>`;
 }
 
@@ -608,7 +1065,7 @@ function tblLocais() {
       <td class="r">${l.zona}</td><td class="r">${l.secoes}</td><td class="r">${fmt(l.aptos)}</td><td class="r">${pct(l.abstencoes / (l.aptos || 1))}</td>
       <td>${c ? `${esc(c.urna)} <small>${pct(ld.v / (validosL(l.id) || 1))}</small>` : '–'}</td></tr>`;
   }).join('');
-  return `<p class="insight" style="margin-top:12px">${S.data.locais.length} locais de votação. “Bairro” é o bairro oficial em que a coordenada do local cai no mapa; “TSE” é o bairro escrito no cadastro do local, que às vezes usa nomes populares (ex.: “Presidente Juscelino”, “Parque Senador”).</p>
+  return `<p class="insight">${S.data.locais.length} locais de votação. “Bairro” é o bairro oficial em que a coordenada do local cai no mapa; “TSE” é o bairro escrito no cadastro do local, que às vezes usa nomes populares (ex.: “Presidente Juscelino”, “Parque Senador”).</p>
     <div class="table-wrap"><table><thead><tr><th>Local</th><th>Bairro</th><th class="r">Zona</th><th class="r">Seções</th><th class="r">Aptos</th><th class="r">Abstenção</th><th>Mais votado (${S.cargo})</th></tr></thead><tbody>${rows}</tbody></table></div>`;
 }
 
@@ -633,6 +1090,11 @@ function tblSobre() {
       <li>“Força relativa” compara o desempenho do candidato no bairro com o desempenho dele na cidade inteira: 1× é igual à média, 2× é o dobro.</li>
       <li>Votos de candidaturas anuladas ou sub judice (${fmt(anulados)} votos para vereador) aparecem no perfil do candidato, mas não contam como válidos.</li>
     </ul>
+    <h3>Raio-X e simulador</h3>
+    <ul>
+      <li>A distribuição de cadeiras segue o Código Eleitoral (quociente eleitoral, quociente partidário, sobras com as exigências de 80% e 20% e, depois, disputa sem mínimo, como decidiu o STF para 2024). Com os votos reais, ela reproduz exatamente os 12 eleitos do TSE.</li>
+      <li>“Faltaram N votos” muda só aquele candidato e mantém todos os outros votos iguais. Os votos somados entram nos válidos e mudam o quociente, como aconteceria numa eleição de verdade.</li>
+    </ul>
     <h3>Atualizar os dados</h3>
     <p>Rode <code>scripts\\download_data.ps1</code> e depois <code>py scripts\\build_data.py</code>. Gerado em ${esc(m.gerado_em.replace('T', ' '))}.</p>
   </div>`;
@@ -651,49 +1113,57 @@ function exportCsv() {
   setTimeout(() => URL.revokeObjectURL(a.href), 1000);
 }
 
-// ------------------------------------------------------------------ KPIs
-
-function renderKpis() {
-  const bs = S.data.bairros;
-  const aptos = bs.reduce((s, b) => s + b.aptos, 0);
-  const comp = bs.reduce((s, b) => s + b.comparecimento, 0);
-  const bn = bs.reduce((s, b) => s + brancosNulos('bairro', b.id), 0);
-  const vt = validosTotal();
-  const first = cands()[0];
-  const tiles = [
-    ['Eleitores aptos', fmt(aptos), `${S.data.locais.length} locais de votação`],
-    ['Comparecimento', pct(comp / aptos), `${fmt(comp)} eleitores`],
-    ['Abstenção', pct(1 - comp / aptos), `${fmt(aptos - comp)} eleitores`],
-    ['Brancos + nulos', pct(bn / comp), `${fmt(bn)} votos`],
-    ['Votos válidos', fmt(vt), S.cargo === 'vereador' ? 'nominais + legenda' : 'para prefeito'],
-    S.cargo === 'vereador'
-      ? ['Quociente eleitoral', fmt(S.data.meta.quociente_eleitoral), `${S.data.meta.cadeiras} cadeiras`]
-      : ['Prefeito eleito', esc(first.urna), `${esc(first.partido)} · ${pct(first.votos / vt)}`, true],
-    S.cargo === 'vereador' ? ['Mais votado', esc(first.urna), `${esc(first.partido)} · ${fmt(first.votos)} votos`, true] : null,
-  ].filter(Boolean);
-  document.getElementById('kpis').innerHTML = tiles.map(([l, v, n, text]) => `<div class="kpi card"><div class="label">${l}</div><div class="value ${text ? 'text' : ''}">${v}</div><div class="note">${n}</div></div>`).join('');
+function renderTable() {
+  const fn = { eleitos: tblEleitos, ranking: tblRanking, partidos: tblPartidos, bairros: tblBairros, locais: tblLocais, sobre: tblSobre }[S.view];
+  document.getElementById('table-title').textContent = VIEWS[S.view].title + (S.view !== 'sobre' && S.view !== 'partidos' ? ` · ${S.cargo}` : '');
+  document.getElementById('table-body').innerHTML = fn();
 }
 
-// ------------------------------------------------------------------ interação
+// ------------------------------------------------------------------ telas
 
-function renderAll() {
+function renderView() {
+  const v = VIEWS[S.view];
+  const camara = S.view === 'raiox' || S.view === 'simulador';
+  document.getElementById('page-title').textContent = v.title;
+  document.getElementById('crumb').textContent = v.title;
+  document.getElementById('page-sub').textContent = v.sub ? v.sub + (camara && S.cargo === 'prefeito' ? ' (vale para vereador, eleição proporcional.)' : '') : '';
+  document.getElementById('page-sub').hidden = !v.sub;
+  document.title = S.view === 'painel' ? 'Mesquita em Dados' : `${v.title} · Mesquita em Dados`;
+  const section = v.table ? 'tabela' : S.view;
+  document.querySelectorAll('.view').forEach((el) => el.classList.toggle('active', el.dataset.view === section));
+  document.querySelectorAll('#nav a').forEach((a) => (a.dataset.view === S.view ? a.setAttribute('aria-current', 'page') : a.removeAttribute('aria-current')));
   document.querySelectorAll('.seg button').forEach((b) => b.setAttribute('aria-checked', String(b.dataset.cargo === S.cargo)));
+
+  if (S.view === 'painel') renderPainel();
+  else if (S.view === 'mapa') renderMapView();
+  else if (S.view === 'raiox') renderRaiox();
+  else if (S.view === 'simulador') renderSimulador();
+  else renderTable();
+  writeHash();
+}
+
+function renderMapView() {
   const sel = document.getElementById('metric');
   sel.innerHTML = Object.entries(METRICS).map(([k, m]) => `<option value="${k}" ${k === S.metric ? 'selected' : ''}>${m.label}</option>`).join('');
   document.getElementById('cand-list').innerHTML = cands().map((c) => `<option value="${esc(candLabel(c))}"></option>`).join('');
   document.getElementById('cand-a').value = D.cand[S.candA] ? candLabel(D.cand[S.candA]) : '';
   document.getElementById('cand-b').value = D.cand[S.candB] ? candLabel(D.cand[S.candB]) : '';
-  renderKpis();
+  if (!map) initMap(); else map.invalidateSize();
   renderMap();
   renderSide();
-  renderTable();
-  writeHash();
 }
 
-function resolveCand(text) {
+function setView(v) {
+  if (!VIEWS[v]) return;
+  S.view = v;
+  closeMenu();
+  renderView();
+  window.scrollTo({ top: 0 });
+}
+
+function resolveIn(list, text) {
   const t = norm(text).trim();
   if (!t) return null;
-  const list = cands();
   return (list.find((c) => norm(candLabel(c)) === t) || list.find((c) => String(c.numero) === t) ||
     list.find((c) => norm(c.urna) === t) || list.find((c) => norm(c.urna).startsWith(t)) || list.find((c) => norm(c.nome).includes(t)))?.sq ?? null;
 }
@@ -706,21 +1176,22 @@ function selectCand(sq, slot = 'A') {
   }
   if (sq && slot === 'B') { S.metric = 'compare'; S.side = 'cand'; }
   if (!sq && slot === 'B' && S.metric === 'compare') S.metric = 'cand_pct';
-  renderAll();
+  if (S.view !== 'mapa') setView('mapa'); else renderView();
 }
 
 function selectBairro(bid) {
   S.bairro = bid;
   S.side = 'bairro';
+  if (S.view !== 'mapa') { setView('mapa'); return; }
   renderMap();
   renderSide();
-  if (S.tab === 'bairros') renderTable();
   writeHash();
 }
 
 function focusLocal(lid) {
   const l = D.local[lid];
   if (!l?.lat) return;
+  if (S.view !== 'mapa') setView('mapa');
   map.flyTo([l.lat, l.lon], 16, { duration: 0.6 });
   localLayer.eachLayer((m) => {
     const p = m.getLatLng();
@@ -731,12 +1202,17 @@ function focusLocal(lid) {
 
 function writeHash() {
   const p = new URLSearchParams();
+  if (S.view !== 'painel') p.set('v', S.view);
   if (S.cargo !== 'vereador') p.set('cargo', S.cargo);
-  if (S.metric !== 'cand_pct') p.set('m', S.metric);
-  if (S.candA) p.set('a', D.cand[S.candA].numero);
-  if (S.candB) p.set('b', D.cand[S.candB].numero);
-  if (S.bairro) p.set('bairro', S.bairro);
-  if (S.tab !== 'eleitos') p.set('tab', S.tab);
+  if (S.view === 'mapa') {
+    if (S.metric !== 'cand_pct') p.set('m', S.metric);
+    if (S.candA) p.set('a', D.cand[S.candA].numero);
+    if (S.candB) p.set('b', D.cand[S.candB].numero);
+    if (S.bairro) p.set('bairro', S.bairro);
+  }
+  if (S.view === 'simulador' && S.sim.length) {
+    p.set('sim', S.sim.map((a) => (a.k.startsWith('c:') ? D.cand[a.k.slice(2)].numero : 'L' + a.k.slice(2)) + ':' + a.d).join(','));
+  }
   const h = p.toString();
   history.replaceState(null, '', h ? '#' + h : location.pathname);
 }
@@ -749,11 +1225,43 @@ function readHash() {
   if (p.get('a')) S.candA = byNum(p.get('a'));
   if (p.get('b')) S.candB = byNum(p.get('b'));
   if (D.bairro[p.get('bairro')]) { S.bairro = p.get('bairro'); S.side = 'bairro'; }
-  if (document.querySelector(`#table-tabs [data-tab="${p.get('tab')}"]`)) S.tab = p.get('tab');
+  const legacyTab = { ranking: 'ranking', partidos: 'partidos', bairros: 'bairros', locais: 'locais', sobre: 'sobre', eleitos: 'eleitos' }[p.get('tab')];
+  if (VIEWS[p.get('v')]) S.view = p.get('v');
+  else if (legacyTab) S.view = legacyTab;
+  else if (p.get('a') || p.get('b') || p.get('bairro') || p.get('m')) S.view = 'mapa'; // links antigos abriam o mapa
+  if (p.get('sim')) {
+    S.sim = [];
+    for (const part of p.get('sim').split(',')) {
+      const [alvo, d] = part.split(':');
+      const n = parseInt(d, 10);
+      if (!n) continue;
+      if (alvo.startsWith('L') && D.partido[alvo.slice(1)]) addAdj('p:' + alvo.slice(1), n);
+      else {
+        const c = vereadores().find((x) => String(x.numero) === alvo && x.valido);
+        if (c) addAdj('c:' + c.sq, n);
+      }
+    }
+  }
   if (!S.candA) S.candA = cands()[0]?.sq ?? null; // começa mostrando o mais votado
 }
 
+// ------------------------------------------------------------------ menu e eventos
+
+function closeMenu() {
+  document.getElementById('sidebar').classList.remove('open');
+  document.getElementById('scrim').hidden = true;
+  document.getElementById('menu-btn').setAttribute('aria-expanded', 'false');
+}
+
 function bindEvents() {
+  document.getElementById('menu-btn').addEventListener('click', () => {
+    const open = !document.getElementById('sidebar').classList.contains('open');
+    document.getElementById('sidebar').classList.toggle('open', open);
+    document.getElementById('scrim').hidden = !open;
+    document.getElementById('menu-btn').setAttribute('aria-expanded', String(open));
+  });
+  document.getElementById('scrim').addEventListener('click', closeMenu);
+
   document.querySelector('.seg').addEventListener('click', (e) => {
     const c = e.target.closest('button')?.dataset.cargo;
     if (!c || c === S.cargo) return;
@@ -761,41 +1269,80 @@ function bindEvents() {
     S.candA = cands()[0].sq;
     S.candB = null;
     if (S.metric === 'compare') S.metric = 'cand_pct';
-    renderAll();
+    renderView();
   });
   document.getElementById('metric').addEventListener('change', (e) => { S.metric = e.target.value; renderMap(); writeHash(); });
   for (const [id, slot] of [['cand-a', 'A'], ['cand-b', 'B']]) {
     const inp = document.getElementById(id);
-    inp.addEventListener('change', () => selectCand(resolveCand(inp.value), slot));
+    inp.addEventListener('change', () => selectCand(resolveIn(cands(), inp.value), slot));
   }
   document.querySelector('.side-tabs').addEventListener('click', (e) => {
     const s = e.target.closest('button')?.dataset.side;
     if (s) { S.side = s; renderSide(); }
   });
-  document.getElementById('table-tabs').addEventListener('click', (e) => {
-    const t = e.target.closest('button')?.dataset.tab;
-    if (t) { S.tab = t; renderTable(); writeHash(); }
-  });
 
-  // cliques delegados em linhas/barras (painel e tabelas)
-  const onPick = (e) => {
-    const t = e.target.closest('[data-cand],[data-bairro],[data-local],th[data-sort]');
+  // um só ouvinte para cliques em toda a área de conteúdo e no menu
+  document.addEventListener('click', (e) => {
+    const simset = e.target.closest('[data-simset]');
+    if (simset) {
+      e.preventDefault();
+      const [tipo, id, d] = simset.dataset.simset.split(':');
+      S.sim = [];
+      addAdj(`${tipo}:${id}`, parseInt(d, 10));
+      setView('simulador');
+      return;
+    }
+    const link = e.target.closest('a[href^="#v="]');
+    if (link) { e.preventDefault(); setView(new URLSearchParams(link.getAttribute('href').slice(1)).get('v')); return; }
+    if (!e.target.closest('.content')) return;
+
+    const t = e.target.closest('[data-cand],[data-bairro],[data-local],th[data-sort],[data-simpick],[data-unadj],[data-preset],[data-quick],#sim-add,#sim-reset,#rk-csv');
     if (!t) return;
-    if (t.matches('th[data-sort]')) {
+    if (t.id === 'rk-csv') exportCsv();
+    else if (t.matches('th[data-sort]')) {
       const k = t.dataset.sort;
       S.rank.dir = S.rank.sort === k ? -S.rank.dir : (k === 'votos' ? -1 : 1);
       S.rank.sort = k;
       renderTable();
-    } else if (t.dataset.cand) {
-      selectCand(t.dataset.cand, 'A');
-      document.getElementById('map').scrollIntoView({ behavior: 'smooth', block: 'center' });
-    } else if (t.dataset.bairro) {
-      selectBairro(t.dataset.bairro);
-      if (t.closest('#table-body')) document.getElementById('map').scrollIntoView({ behavior: 'smooth', block: 'center' });
-    } else if (t.dataset.local) focusLocal(t.dataset.local);
-  };
-  document.getElementById('side-body').addEventListener('click', onPick);
-  document.getElementById('table-body').addEventListener('click', onPick);
+    } else if (t.id === 'sim-add' || t.dataset.quick) {
+      const k = resolveSimTarget(document.getElementById('sim-alvo').value);
+      const d = parseInt(t.dataset.quick || document.getElementById('sim-d').value, 10);
+      if (!k) { document.getElementById('sim-alvo').focus(); return; }
+      addAdj(k, d || 0);
+      renderView();
+    } else if (t.id === 'sim-reset') { S.sim = []; renderView(); }
+    else if (t.dataset.unadj) { S.sim.splice(+t.dataset.unadj, 1); renderView(); }
+    else if (t.dataset.preset) { S.sim = simPresets()[+t.dataset.preset].adj.map((a) => ({ ...a })); renderView(); }
+    else if (t.dataset.simpick) {
+      const inp = document.getElementById('sim-alvo');
+      inp.value = candLabel(D.cand[t.dataset.simpick]);
+      document.getElementById('sim-d').focus();
+    } else if (t.dataset.cand) selectCand(t.dataset.cand, 'A');
+    else if (t.dataset.bairro) selectBairro(t.dataset.bairro);
+    else if (t.dataset.local) focusLocal(t.dataset.local);
+  });
+
+  // teclado nas cadeiras do hemiciclo (são <circle> com role=button)
+  document.addEventListener('keydown', (e) => {
+    if ((e.key === 'Enter' || e.key === ' ') && e.target.matches?.('.seat')) { e.preventDefault(); e.target.dispatchEvent(new MouseEvent('click', { bubbles: true })); }
+    if (e.key === 'Enter' && e.target.id === 'sim-d') document.getElementById('sim-add').click();
+    if (e.key === 'Escape') closeMenu();
+  });
+
+  // dica flutuante para elementos com data-tip (cadeiras, faixas)
+  const tip = document.createElement('div');
+  tip.className = 'tip';
+  tip.hidden = true;
+  document.body.appendChild(tip);
+  document.addEventListener('pointermove', (e) => {
+    const el = e.target.closest?.('[data-tip]');
+    if (!el) { tip.hidden = true; return; }
+    tip.innerHTML = el.dataset.tip;
+    tip.hidden = false;
+    const w = tip.offsetWidth, h = tip.offsetHeight;
+    tip.style.left = Math.min(window.innerWidth - w - 8, e.clientX + 14) + 'px';
+    tip.style.top = (e.clientY - h - 12 < 4 ? e.clientY + 18 : e.clientY - h - 12) + 'px';
+  });
 
   const tb = document.getElementById('table-body');
   tb.addEventListener('input', (e) => {
@@ -810,16 +1357,15 @@ function bindEvents() {
     if (e.target.id === 'rk-p') { S.rank.partido = e.target.value; renderTable(); }
     if (e.target.id === 'rk-s') { S.rank.situacao = e.target.value; renderTable(); }
   });
-  tb.addEventListener('click', (e) => { if (e.target.id === 'rk-csv') exportCsv(); });
 
+  const retheme = () => { setTiles(); renderView(); };
   document.getElementById('theme-toggle').addEventListener('click', () => {
     const next = theme() === 'dark' ? 'light' : 'dark';
     document.documentElement.dataset.theme = next;
     try { localStorage.setItem('theme', next); } catch { /* armazenamento indisponível */ }
-    setTiles();
-    renderMap();
+    retheme();
   });
-  matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => { setTiles(); renderMap(); });
+  matchMedia('(prefers-color-scheme: dark)').addEventListener('change', retheme);
 }
 
 (async function main() {
@@ -827,13 +1373,14 @@ function bindEvents() {
   try {
     await load();
   } catch (err) {
-    document.querySelector('.layout').innerHTML = `<p class="card empty" style="padding:16px">Não consegui carregar os dados (${esc(err.message)}). Abra o app por um servidor local: <code>py -m http.server -d web 8000</code>.</p>`;
+    document.querySelector('.content').innerHTML = `<p class="panel empty" style="padding:16px">Não consegui carregar os dados (${esc(err.message)}). Abra o app por um servidor local: <code>py -m http.server -d web 8000</code>.</p>`;
     return;
   }
   readHash();
-  initMap();
   bindEvents();
+  const dias = diasPara2028();
+  document.getElementById('countdown').innerHTML = `<strong>${fmt(dias)}</strong><span>dias para a eleição de 2028</span>`;
   const m = S.data.meta;
   document.getElementById('foot').innerHTML = `Fontes: ${m.fontes.map(esc).join(' · ')}. Dados gerados em ${esc(m.gerado_em.replace('T', ' '))}.`;
-  renderAll();
+  renderView();
 })();

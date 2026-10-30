@@ -37,6 +37,17 @@ com o total oficial de cada candidato.
 
 ## Funcionalidades
 
+Layout de painel administrativo (menu lateral, quadros de indicador, painéis), com estas telas:
+
+- **Dashboard**: eleitores, comparecimento, quociente, contagem regressiva para 2028, a Câmara eleita em
+  hemiciclo, mais votados, comparecimento por bairro e quem ficou "por um fio".
+- **Raio-X da Câmara**: quanto dos votos foi para eleitos, por que ninguém se elegeu sozinho, quem teve
+  mais votos que um eleito e ficou de fora, o que mudaria com "os 12 mais votados levam", votos que
+  faltaram/sobraram para cada candidato e quanto custou cada cadeira por partido.
+- **Simulador "E se?"**: soma ou tira votos de candidatos e de legenda e redistribui as 12 cadeiras na
+  hora. O motor (`web/eleicao.js`) segue o Código Eleitoral com a regra das sobras de 2024 e reproduz
+  exatamente os eleitos do TSE (`node tests/eleicao.test.js`). O cenário vai na URL
+  (ex. `#v=simulador&sim=25000:10000`).
 - **Mapa por bairro**: % do candidato nos votos válidos, votos absolutos, força relativa (bairro ÷ cidade),
   comparação A × B (escala divergente), mais votado por bairro, abstenção, brancos+nulos, eleitores aptos.
   Os locais de votação aparecem como círculos (tamanho = votos do candidato ou eleitores aptos), com popup
