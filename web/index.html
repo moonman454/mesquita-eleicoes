@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Votos em Mesquita</title>
+  <meta name="description" content="Distribuição dos votos da eleição municipal de 2024 em Mesquita/RJ por bairro e local de votação.">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <h1>Votos em Mesquita</h1>
+      <p class="sub">Eleição municipal de 6 de outubro de 2024 · 1º turno · dados do TSE</p>
+    </div>
+    <div class="top-controls">
+      <div class="seg" role="radiogroup" aria-label="Cargo">
+        <button type="button" role="radio" data-cargo="vereador" aria-checked="true">Vereador</button>
+        <button type="button" role="radio" data-cargo="prefeito" aria-checked="false">Prefeito</button>
+      </div>
+      <button type="button" id="theme-toggle" class="icon-btn" aria-label="Alternar tema claro/escuro" title="Tema">◐</button>
+    </div>
+  </header>
+
+  <section class="kpis" id="kpis" aria-label="Resumo da eleição"></section>
+
+  <main class="layout">
+    <section class="map-card card" aria-label="Mapa">
+      <div class="map-toolbar">
+        <label class="field">
+          <span>Pintar o mapa por</span>
+          <select id="metric"></select>
+        </label>
+        <p class="map-hint" id="map-hint"></p>
+      </div>
+      <div id="map" role="application" aria-label="Mapa dos bairros de Mesquita"></div>
+      <div class="legend" id="legend" aria-live="polite"></div>
+    </section>
+
+    <aside class="side card" aria-label="Detalhes">
+      <div class="pickers">
+        <label class="field">
+          <span>Candidato</span>
+          <input id="cand-a" list="cand-list" placeholder="Nome de urna, nome ou número" autocomplete="off">
+        </label>
+        <label class="field">
+          <span>Comparar com <small>(opcional)</small></span>
+          <input id="cand-b" list="cand-list" placeholder="Outro candidato" autocomplete="off">
+        </label>
+        <datalist id="cand-list"></datalist>
+      </div>
+      <div class="side-tabs" role="tablist">
+        <button type="button" role="tab" data-side="cand" aria-selected="true">Candidato</button>
+        <button type="button" role="tab" data-side="bairro" aria-selected="false">Bairro</button>
+      </div>
+      <div id="side-body" class="side-body"></div>
+    </aside>
+  </main>
+
+  <section class="card tables">
+    <div class="tabs" role="tablist" id="table-tabs">
+      <button type="button" role="tab" data-tab="eleitos" aria-selected="true">Eleitos</button>
+      <button type="button" role="tab" data-tab="ranking" aria-selected="false">Ranking</button>
+      <button type="button" role="tab" data-tab="partidos" aria-selected="false">Partidos</button>
+      <button type="button" role="tab" data-tab="bairros" aria-selected="false">Bairros</button>
+      <button type="button" role="tab" data-tab="locais" aria-selected="false">Locais de votação</button>
+      <button type="button" role="tab" data-tab="sobre" aria-selected="false">Sobre os dados</button>
+    </div>
+    <div id="table-body"></div>
+  </section>
+
+  <footer class="foot" id="foot"></footer>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
